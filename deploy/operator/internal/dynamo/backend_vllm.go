@@ -146,6 +146,13 @@ const (
 	waitLeaderScriptKey       = "wait-for-leader.py"
 	waitLeaderVolumeName      = "wait-leader-script"
 	waitLeaderMountPath       = "/scripts"
+
+	// rayWorkerLaunchPrefix is the exact command injectRayDistributedLaunchFlags
+	// gives a plain TP/PP Ray multinode worker. It is distinct from the
+	// elastic-EP Ray worker command (prefixed by that path's own leader
+	// health-gate) and from the data-parallel-Ray path (which keeps the vLLM
+	// command intact), so matching it identifies this one launch shape only.
+	rayWorkerLaunchPrefix = "ray start --address="
 )
 
 // WaitLeaderScript is the Python script that verifies leader pod health via
@@ -255,7 +262,8 @@ func GenerateWaitLeaderConfigMap(dgdName, namespace string) *corev1.ConfigMap {
 }
 
 func (b *VLLMBackend) UpdatePodSpec(podSpec *corev1.PodSpec, numberOfNodes int32, role Role, _ *v1beta1.DynamoComponentDeploymentSharedSpec, serviceName string, multinodeDeployer MultinodeDeployer) {
-	if !b.shouldInjectVLLMMpWaitLeaderInit(podSpec, numberOfNodes, role) {
+	waitPort, initContainerName, ok := b.waitForLeaderPortAndName(podSpec, numberOfNodes, role)
+	if !ok {
 		return
 	}
 
@@ -282,11 +290,11 @@ func (b *VLLMBackend) UpdatePodSpec(podSpec *corev1.PodSpec, numberOfNodes int32
 	// definition order.
 	shellHostname := k8sToShellVarSyntax(leaderHostname)
 	initContainer := corev1.Container{
-		Name:  "wait-for-leader-mp",
+		Name:  initContainerName,
 		Image: mainImage,
 		Command: []string{"sh", "-c", fmt.Sprintf(
 			`export LEADER_HOST="%s" LEADER_PORT="%s" && exec python3 %s/%s`,
-			shellHostname, commonconsts.VLLMMpMasterPort, waitLeaderMountPath, waitLeaderScriptKey)},
+			shellHostname, waitPort, waitLeaderMountPath, waitLeaderScriptKey)},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      waitLeaderVolumeName,
@@ -299,12 +307,33 @@ func (b *VLLMBackend) UpdatePodSpec(podSpec *corev1.PodSpec, numberOfNodes int32
 	podSpec.InitContainers = append(podSpec.InitContainers, initContainer)
 }
 
-func (b *VLLMBackend) shouldInjectVLLMMpWaitLeaderInit(podSpec *corev1.PodSpec, numberOfNodes int32, role Role) bool {
+// waitForLeaderPortAndName reports the leader port to wait on and the name to
+// give the init container for a multinode worker whose main container's
+// launch command depends on the leader being reachable before it starts, or
+// ok=false when this pod does not need to wait.
+//
+// mp workers carry --distributed-executor-backend mp in their own launch
+// command (injectMpDistributedLaunchFlags) and wait on vLLM's MP master port.
+// Plain TP/PP Ray workers (injectRayDistributedLaunchFlags) are rewritten to
+// the exact single-argument `ray start --address=<host>:<port> --block` and
+// wait on the Ray GCS port instead; that exact shape is what distinguishes
+// them from the elastic-EP Ray worker (prefixed by its own leader health-gate)
+// and the data-parallel-Ray path (which keeps the full vLLM command), both of
+// which already handle leader readiness themselves and must not also get this
+// init container.
+func (b *VLLMBackend) waitForLeaderPortAndName(podSpec *corev1.PodSpec, numberOfNodes int32, role Role) (port, name string, ok bool) {
 	if b.ParentGraphDeploymentName == "" || numberOfNodes <= 1 || role != RoleWorker || len(podSpec.Containers) == 0 {
-		return false
+		return "", "", false
 	}
 
-	return containerCommandLineHasArg(&podSpec.Containers[0], distributedExecutorFlag, "mp")
+	container := &podSpec.Containers[0]
+	if containerCommandLineHasArg(container, distributedExecutorFlag, "mp") {
+		return commonconsts.VLLMMpMasterPort, "wait-for-leader-mp", true
+	}
+	if len(container.Args) == 1 && strings.HasPrefix(strings.TrimSpace(container.Args[0]), rayWorkerLaunchPrefix) {
+		return VLLMPort, "wait-for-leader-ray", true
+	}
+	return "", "", false
 }
 
 // updateVLLMMultinodeArgs dispatches to the appropriate injection function based on
@@ -403,6 +432,18 @@ func injectMpDistributedLaunchFlags(container *corev1.Container, role Role, serv
 	injectFlagsIntoContainerCommand(container, mpFlags, needsShell, "vllm")
 }
 
+// injectRayDistributedLaunchFlags injects the Ray launch commands for multi-node TP/PP
+// deployments.
+//
+// Leader: starts the Ray head, then runs the original vLLM command with
+// --distributed-executor-backend ray.
+//
+// Worker: only starts a Ray agent joining the leader's cluster; vLLM on the
+// leader spawns Ray actors on it. An init container (injected via
+// UpdatePodSpec) handles waiting for the leader's Ray port before the
+// worker's main container starts -- without it, a worker whose pod starts
+// before the leader's Ray head is listening never successfully joins the
+// cluster and needs to be deleted and recreated.
 func injectRayDistributedLaunchFlags(container *corev1.Container, role Role, serviceName string, multinodeDeployer MultinodeDeployer) {
 	switch role {
 	case RoleLeader:
